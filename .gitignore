@@ -2,6 +2,7 @@
 *.exe
 *.obj
 *.o
+*.ini
 
 # Local editor and debugger files
 .vscode/

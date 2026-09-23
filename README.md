@@ -20,10 +20,10 @@ Standard laptop trackpads output relative mouse deltas with software acceleratio
 1. Download `precision-trackpad-mapper.exe` from [Releases](https://github.com/nameeenameee/precision-trackpad-mapper/releases).
 2. **Windows Touchpad Settings:**
    - Open **Settings → Bluetooth & devices → Touchpad**.
-   - Turn off **"Tap with a single finger to single-click"** (prevents errant clicks while hovering/aiming).
+   - Turn off **"Tap with a single finger to single-click"** (prevents stray clicks while hovering/aiming).
    - Disable multi-finger swipes and gestures to avoid accidental desktop switches mid-song.
 3. **In-game *osu!* Settings:**
-   - **Disable Raw Input** inside *osu!* (PTM drives the Windows OS cursor; in-game raw input reads mouse deltas directly and will cause erratic jumping).
+   - **Enable Device: Tablet (External)** in *osu!lazer* for PTM to work correctly.
    - Set in-game mouse sensitivity strictly to **1.0x**.
 4. Run `precision-trackpad-mapper.exe`. Press `Esc` or `Ctrl+C` in the console window to stop.
 
