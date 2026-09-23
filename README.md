@@ -1,56 +1,36 @@
-# finger-draw
+# Precision Trackpad Mapper (PTM)
 
-Windows utility that turns a multitouch trackpad into a drawing surface by
-mapping trackpad coordinates to a screen region and injecting mouse input.
+Turn your Windows Precision Touchpad into a low-latency, absolute-positioning tablet surface — designed for *osu!* and fast desktop navigation without requiring a physical graphics tablet.
 
-This repository is prepared from a fork of work by **arpruss**. The original
-MIT license and copyright notice are retained in [LICENSE](LICENSE).
+Standard laptop touchpads use relative movement with OS pointer acceleration. **Precision Trackpad Mapper** captures raw hardware coordinates and maps the touchpad area directly to your monitor bounds (1:1 absolute positioning).
 
-## Build
+---
 
-Build with MinGW-w64 and GNU Make:
+## Features
 
-```text
-make
-```
+- **Absolute 1:1 Mapping:** The top-left of your touchpad is the top-left of your screen.
+- **Low Latency Raw Input:** Bypasses standard Windows pointer ballistics and mouse acceleration via `WM_INPUT`.
+- **Built for osu!:** Instantaneous cursor tracking while tapping keys (`Z`/`X`) on your keyboard.
+- **Minimal & Portable:** Single self-contained Windows executable with zero runtime dependencies.
 
-Or build directly from a MinGW shell:
+---
 
-```text
-gcc finger-draw.c -o finger-draw.exe -mconsole -lhid -lsetupapi
-```
+## Quick Start
 
-The program is Windows-only and uses the Windows Raw Input, HID, and mouse
-input APIs.
+1. Download the latest binary (`precision-trackpad-mapper.exe`) from the [Releases](https://github.com/nameeenameee/precision-trackpad-mapper/releases) section.
+2. Run the executable.
+3. **Recommended Windows Settings:**
+   - Go to **Windows Settings → Bluetooth & devices → Touchpad**.
+   - Disable multi-finger gestures (three-finger and four-finger taps/swipes) to avoid accidental desktop switches during gameplay.
+4. Close the console window or press `Esc` / `Ctrl+C` to stop tracking.
 
-## Usage
+---
 
-Run `finger-draw.exe` from a console. On first run, either accept the default
-trackpad coordinate range or enter the raw limits for the device.
+## Building from Source
 
-Controls:
+### Prerequisites
+- GCC (MinGW-w64) or MSVC on Windows
 
-- `Ctrl+Win`: define the screen region using two corner presses.
-- `Ctrl+Alt+Win`: define the trackpad region using two touched corners.
-- `Alt+Win`: activate or deactivate drawing mode.
-- Backtick (`` ` ``): lower the pen by default; use `--fn-lift` to reverse
-  this behavior or `--fn-none` to ignore the key.
-- `Ctrl+C`: quit.
-
-Useful options:
-
-```text
---window T,L,B,R
---trackpad X1,Y1,X2,Y2
---fn-lift
---fn-down
---fn-none
---help
-```
-
-Generated executables and object files are intentionally excluded from the
-repository. Build artifacts can be removed with:
-
-```text
-make clean
-```
+### Build with GCC / MinGW:
+```bash
+gcc -O3 -o precision-trackpad-mapper.exe finger-draw.c -luser32 -lgdi32
