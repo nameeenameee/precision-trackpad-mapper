@@ -6,9 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define OUT_BUFFER_SIZE 4096
-#define OUT_BUFFER_MASK (OUT_BUFFER_SIZE - 1)
-#define IN_BUFFER_SIZE  4096
+#define EVENT_QUEUE_SIZE 128
+#define EVENT_QUEUE_MASK (EVENT_QUEUE_SIZE - 1)
+#define IN_BUFFER_SIZE   4096
 #define MAX_CACHED_DEVICES 16
 
 enum {
@@ -24,23 +24,61 @@ enum {
     MODE_ACTIVE = 3
 };
 
-// Key Scancodes (0x00 = Unbound / Disabled)
-static USHORT keyMainMod    = 0x1D; // LCtrl
-static USHORT keyQuickMod   = 0x38; // LAlt
-static USHORT keyActivate   = 0x5B; // LWin
-static USHORT keySettings   = 0x18; // O
-static USHORT keyLeftClick  = 0x29; // ` (Backtick)
-static USHORT keyRightClick = 0x00; // Disabled
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;          // 'PTMC'
+    uint16_t version;        // 1
+    USHORT keyMainMod;
+    USHORT keyQuickMod;
+    USHORT keyActivate;
+    USHORT keySettings;
+    USHORT keyLeftClick;
+    USHORT keyRightClick;
+    int32_t fnMode;
+    int32_t topLeftX;
+    int32_t topLeftY;
+    int32_t bottomRightX;
+    int32_t bottomRightY;
+    int64_t trackpadTopLeftX;
+    int64_t trackpadTopLeftY;
+    int64_t trackpadBottomRightX;
+    int64_t trackpadBottomRightY;
+} AppConfig;
+#pragma pack(pop)
 
-static volatile int downMainMod    = 0;
-static volatile int downQuickMod   = 0;
-static volatile int downActivate   = 0;
-static volatile int downSettings   = 0;
-static volatile int downLeftClick  = 0;
-static volatile int downRightClick = 0;
+#define CONFIG_MAGIC 0x434D5450 // 'PTMC'
 
-static int leftTouching  = 0;
-static int rightTouching = 0;
+static AppConfig g_cfg = {
+    .magic = CONFIG_MAGIC,
+    .version = 1,
+    .keyMainMod = 0x1D,    // LCtrl
+    .keyQuickMod = 0x38,   // LAlt
+    .keyActivate = 0x5B,   // LWin
+    .keySettings = 0x18,   // O
+    .keyLeftClick = 0x29,  // ` (Backtick)
+    .keyRightClick = 0x00, // Disabled
+    .fnMode = FN_MODE_DOWN,
+    .topLeftX = 0,
+    .topLeftY = 0,
+    .bottomRightX = 0,
+    .bottomRightY = 0,
+    .trackpadTopLeftX = 0,
+    .trackpadTopLeftY = 0,
+    .trackpadBottomRightX = 2904,
+    .trackpadBottomRightY = 1879
+};
+
+static SRWLOCK g_cfgLock = SRWLOCK_INIT;
+
+static volatile LONG g_downMainMod    = 0;
+static volatile LONG g_downQuickMod   = 0;
+static volatile LONG g_downActivate   = 0;
+static volatile LONG g_downSettings   = 0;
+static volatile LONG g_downLeftClick  = 0;
+static volatile LONG g_downRightClick = 0;
+
+static volatile LONG g_leftTouching   = 0;
+static volatile LONG g_rightTouching  = 0;
 
 typedef struct {
     HANDLE deviceHandle;
@@ -49,131 +87,87 @@ typedef struct {
 
 static CachedDevice g_deviceCache[MAX_CACHED_DEVICES];
 static int g_deviceCacheCount = 0;
+static int g_deviceCacheNextEvict = 0;
 
-static volatile int fnMode = FN_MODE_DOWN; 
-static HHOOK miHook = NULL;
+static volatile LONG g_running = 1;
+static volatile LONG g_mode = MODE_NONE;
+static volatile LONG g_inSettingsMenu = 0;
+static volatile LONG g_activeContactId = -1;
 
-static INPUT outBuffer[OUT_BUFFER_SIZE];
-static unsigned outBufferHead = 0;
-static unsigned outBufferTail = 0;
-static CRITICAL_SECTION queueLock;
-static HANDLE queueReady;
-static volatile LONG running = 1;
+/* Lock-free Single-Producer Single-Consumer Button Queue */
+static INPUT g_buttonQueue[EVENT_QUEUE_SIZE];
+static volatile LONG g_queueHead = 0;
+static volatile LONG g_queueTail = 0;
+static HANDLE g_hWorkerWakeEvent = NULL;
 
-static volatile int mode = MODE_NONE;
-static volatile int inSettingsMenu = 0;
-static volatile int mouseX = 0;
-static volatile int mouseY = 0;
+static volatile LONG g_vLeft = 0;
+static volatile LONG g_vTop = 0;
+static volatile LONG g_vWidth = 1;
+static volatile LONG g_vHeight = 1;
 
-// Screen Bounds & Virtual Screen Cache
-static int topLeftX = 0, topLeftY = 0;
-static int bottomRightX = 0, bottomRightY = 0;
-static int vLeft = 0, vTop = 0, vWidth = 0, vHeight = 0;
+static volatile LONG g_latestRawX = -1;
+static volatile LONG g_latestRawY = -1;
+static volatile LONG g_cursorX = 0;
+static volatile LONG g_cursorY = 0;
 
-// Trackpad Bounds
-static long trackpadTopLeftX = 0, trackpadTopLeftY = 0; 
-static long trackpadBottomRightX = 2904, trackpadBottomRightY = 1879; 
-static volatile long rawX = -1, rawY = -1; 
-
-// Fixed-point scale factors (16.16)
-static int64_t mapScaleX = 0;
-static int64_t mapScaleY = 0;
-static int screenRegionDefined = 1;
-static int trackpadRegionDefined = 1;
-
-static HWND g_hWnd = NULL;
+static HWND g_hMsgWnd = NULL;
 static HANDLE g_hWorkerThread = NULL;
+static HANDLE g_hHookThread = NULL;
+static DWORD g_hookThreadId = 0;
 
 void updateScreenMetrics(void) {
-    vLeft   = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    vTop    = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    vWidth  = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    vHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-}
-
-void recalculateMappingFactors(void) {
-    long tpW = trackpadBottomRightX - trackpadTopLeftX;
-    long tpH = trackpadBottomRightY - trackpadTopLeftY;
-    if (tpW <= 0) tpW = 1;
-    if (tpH <= 0) tpH = 1;
-
-    mapScaleX = (((int64_t)(bottomRightX - topLeftX)) << 16) / tpW;
-    mapScaleY = (((int64_t)(bottomRightY - topLeftY)) << 16) / tpH;
+    InterlockedExchange(&g_vLeft,   GetSystemMetrics(SM_XVIRTUALSCREEN));
+    InterlockedExchange(&g_vTop,    GetSystemMetrics(SM_YVIRTUALSCREEN));
+    InterlockedExchange(&g_vWidth,  GetSystemMetrics(SM_CXVIRTUALSCREEN));
+    InterlockedExchange(&g_vHeight, GetSystemMetrics(SM_CYVIRTUALSCREEN));
 }
 
 static void getConfigPath(char* outPath, size_t maxLen) {
     DWORD len = GetModuleFileNameA(NULL, outPath, (DWORD)maxLen);
     if (len == 0 || len >= maxLen) {
-        strncpy(outPath, ".\\trackpad_config.ini", maxLen);
+        strncpy(outPath, ".\\trackpad_config.bin", maxLen);
         return;
     }
     char* lastSlash = strrchr(outPath, '\\');
     if (lastSlash) {
         *(lastSlash + 1) = '\0';
-        strncat(outPath, "trackpad_config.ini", maxLen - strlen(outPath) - 1);
+        strncat(outPath, "trackpad_config.bin", maxLen - strlen(outPath) - 1);
     } else {
-        strncpy(outPath, ".\\trackpad_config.ini", maxLen);
+        strncpy(outPath, ".\\trackpad_config.bin", maxLen);
     }
 }
 
-void saveSettings(void) {
-    char cfg[MAX_PATH];
-    char buf[64];
-    getConfigPath(cfg, sizeof(cfg));
+void saveSettingsAsync(void) {
+    char path[MAX_PATH];
+    getConfigPath(path, sizeof(path));
+    HANDLE hFile = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        AcquireSRWLockShared(&g_cfgLock);
+        AppConfig snap = g_cfg;
+        ReleaseSRWLockShared(&g_cfgLock);
 
-    sprintf(buf, "%u", keyMainMod);    WritePrivateProfileStringA("Keybinds", "MainMod", buf, cfg);
-    sprintf(buf, "%u", keyQuickMod);   WritePrivateProfileStringA("Keybinds", "QuickMod", buf, cfg);
-    sprintf(buf, "%u", keyActivate);   WritePrivateProfileStringA("Keybinds", "Activate", buf, cfg);
-    sprintf(buf, "%u", keySettings);   WritePrivateProfileStringA("Keybinds", "Settings", buf, cfg);
-    sprintf(buf, "%u", keyLeftClick);  WritePrivateProfileStringA("Keybinds", "LeftClick", buf, cfg);
-    sprintf(buf, "%u", keyRightClick); WritePrivateProfileStringA("Keybinds", "RightClick", buf, cfg);
-
-    sprintf(buf, "%d", fnMode);        WritePrivateProfileStringA("General", "FnMode", buf, cfg);
-
-    sprintf(buf, "%d", topLeftX);      WritePrivateProfileStringA("Screen", "TopLeftX", buf, cfg);
-    sprintf(buf, "%d", topLeftY);      WritePrivateProfileStringA("Screen", "TopLeftY", buf, cfg);
-    sprintf(buf, "%d", bottomRightX);  WritePrivateProfileStringA("Screen", "BottomRightX", buf, cfg);
-    sprintf(buf, "%d", bottomRightY);  WritePrivateProfileStringA("Screen", "BottomRightY", buf, cfg);
-
-    sprintf(buf, "%ld", trackpadTopLeftX);     WritePrivateProfileStringA("Trackpad", "TopLeftX", buf, cfg);
-    sprintf(buf, "%ld", trackpadTopLeftY);     WritePrivateProfileStringA("Trackpad", "TopLeftY", buf, cfg);
-    sprintf(buf, "%ld", trackpadBottomRightX); WritePrivateProfileStringA("Trackpad", "BottomRightX", buf, cfg);
-    sprintf(buf, "%ld", trackpadBottomRightY); WritePrivateProfileStringA("Trackpad", "BottomRightY", buf, cfg);
-
-    recalculateMappingFactors();
-    printf("\n[Settings saved to %s]\n", cfg);
+        WriteFile(hFile, &snap, sizeof(AppConfig), &written, NULL);
+        CloseHandle(hFile);
+    }
 }
 
 void loadSettings(void) {
-    char cfg[MAX_PATH];
-    getConfigPath(cfg, sizeof(cfg));
-
-    DWORD attr = GetFileAttributesA(cfg);
-    if (attr == INVALID_FILE_ATTRIBUTES) {
-        recalculateMappingFactors();
-        return;
+    char path[MAX_PATH];
+    getConfigPath(path, sizeof(path));
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        AppConfig temp;
+        DWORD read = 0;
+        if (ReadFile(hFile, &temp, sizeof(AppConfig), &read, NULL) && read == sizeof(AppConfig)) {
+            if (temp.magic == CONFIG_MAGIC) {
+                AcquireSRWLockExclusive(&g_cfgLock);
+                g_cfg = temp;
+                ReleaseSRWLockExclusive(&g_cfgLock);
+            }
+        }
+        CloseHandle(hFile);
     }
-
-    keyMainMod    = (USHORT)GetPrivateProfileIntA("Keybinds", "MainMod", keyMainMod, cfg);
-    keyQuickMod   = (USHORT)GetPrivateProfileIntA("Keybinds", "QuickMod", keyQuickMod, cfg);
-    keyActivate   = (USHORT)GetPrivateProfileIntA("Keybinds", "Activate", keyActivate, cfg);
-    keySettings   = (USHORT)GetPrivateProfileIntA("Keybinds", "Settings", keySettings, cfg);
-    keyLeftClick  = (USHORT)GetPrivateProfileIntA("Keybinds", "LeftClick", keyLeftClick, cfg);
-    keyRightClick = (USHORT)GetPrivateProfileIntA("Keybinds", "RightClick", keyRightClick, cfg);
-
-    fnMode = GetPrivateProfileIntA("General", "FnMode", fnMode, cfg);
-
-    topLeftX     = GetPrivateProfileIntA("Screen", "TopLeftX", topLeftX, cfg);
-    topLeftY     = GetPrivateProfileIntA("Screen", "TopLeftY", topLeftY, cfg);
-    bottomRightX = GetPrivateProfileIntA("Screen", "BottomRightX", bottomRightX, cfg);
-    bottomRightY = GetPrivateProfileIntA("Screen", "BottomRightY", bottomRightY, cfg);
-
-    trackpadTopLeftX     = GetPrivateProfileIntA("Trackpad", "TopLeftX", (int)trackpadTopLeftX, cfg);
-    trackpadTopLeftY     = GetPrivateProfileIntA("Trackpad", "TopLeftY", (int)trackpadTopLeftY, cfg);
-    trackpadBottomRightX = GetPrivateProfileIntA("Trackpad", "BottomRightX", (int)trackpadBottomRightX, cfg);
-    trackpadBottomRightY = GetPrivateProfileIntA("Trackpad", "BottomRightY", (int)trackpadBottomRightY, cfg);
-
-    recalculateMappingFactors();
 }
 
 PHIDP_PREPARSED_DATA getOrCachePreparsed(HANDLE hDevice) {
@@ -199,308 +193,385 @@ PHIDP_PREPARSED_DATA getOrCachePreparsed(HANDLE hDevice) {
         g_deviceCache[g_deviceCacheCount].preparsed = preparsed;
         g_deviceCacheCount++;
     } else {
-        // Drop and replace first entry when full
-        free(g_deviceCache[0].preparsed);
-        g_deviceCache[0].deviceHandle = hDevice;
-        g_deviceCache[0].preparsed = preparsed;
+        int idx = g_deviceCacheNextEvict;
+        g_deviceCacheNextEvict = (g_deviceCacheNextEvict + 1) % MAX_CACHED_DEVICES;
+        free(g_deviceCache[idx].preparsed);
+        g_deviceCache[idx].deviceHandle = hDevice;
+        g_deviceCache[idx].preparsed = preparsed;
     }
     return preparsed;
 }
 
-LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+/* Lock-free push into SPSC queue */
+static inline void pushButtonEvent(DWORD dwFlags) {
+    INPUT ip = {0};
+    ip.type = INPUT_MOUSE;
+    ip.mi.dwFlags = dwFlags;
+
+    LONG tail = InterlockedCompareExchange(&g_queueTail, 0, 0);
+    LONG head = InterlockedCompareExchange(&g_queueHead, 0, 0);
+    LONG nextTail = (tail + 1) & EVENT_QUEUE_MASK;
+
+    if (nextTail != head) {
+        g_buttonQueue[tail] = ip;
+        MemoryBarrier();
+        InterlockedExchange(&g_queueTail, nextTail);
+        SetEvent(g_hWorkerWakeEvent);
+    }
+}
+
+/* Worker thread consumes button events only */
+DWORD WINAPI workerThreadProc(void* arg) {
+    (void)arg;
+    INPUT batch[EVENT_QUEUE_SIZE];
+
+    while (InterlockedCompareExchange(&g_running, 1, 1)) {
+        WaitForSingleObject(g_hWorkerWakeEvent, INFINITE);
+
+        UINT batchCount = 0;
+        LONG head = InterlockedCompareExchange(&g_queueHead, 0, 0);
+        LONG tail = InterlockedCompareExchange(&g_queueTail, 0, 0);
+
+        while (head != tail && batchCount < EVENT_QUEUE_SIZE) {
+            batch[batchCount++] = g_buttonQueue[head];
+            head = (head + 1) & EVENT_QUEUE_MASK;
+        }
+
+        if (batchCount > 0) {
+            InterlockedExchange(&g_queueHead, head);
+            SendInput(batchCount, batch, sizeof(INPUT));
+        }
+    }
+    return 0;
+}
+
+LRESULT CALLBACK IsolatedLowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         MSLLHOOKSTRUCT* p = (MSLLHOOKSTRUCT*)lParam;
         if (wParam == WM_MOUSEMOVE) {
-            mouseX = p->pt.x;
-            mouseY = p->pt.y;
+            InterlockedExchange(&g_cursorX, p->pt.x);
+            InterlockedExchange(&g_cursorY, p->pt.y);
         }
         if (!(p->flags & LLMHF_INJECTED)) {
-            if (mode == MODE_ACTIVE) return 1; // Block hardware mouse events while mapping is active
-        }
-    }
-    return CallNextHookEx(miHook, nCode, wParam, lParam);
-}
-
-void setHookState(int enable) {
-    if (enable && !miHook) {
-        miHook = SetWindowsHookEx(WH_MOUSE_LL, (HOOKPROC)LowLevelMouseProc, GetModuleHandle(NULL), 0);
-    } else if (!enable && miHook) {
-        UnhookWindowsHookEx(miHook);
-        miHook = NULL;
-    }
-}
-
-int pushBuffer(const INPUT* i) {
-    EnterCriticalSection(&queueLock);
-    unsigned nextTail = (outBufferTail + 1) & OUT_BUFFER_MASK;
-    if (nextTail == outBufferHead) {
-        LeaveCriticalSection(&queueLock);
-        return -1; // Buffer full; drop frame
-    }
-    outBuffer[outBufferTail] = *i;
-    outBufferTail = nextTail;
-    LeaveCriticalSection(&queueLock);
-    SetEvent(queueReady);
-    return 0;
-}
-
-DWORD WINAPI handleQueue(void* arg) {
-    (void)arg;
-    INPUT batch[64];
-    while (InterlockedCompareExchange(&running, 1, 1)) {
-        WaitForSingleObject(queueReady, INFINITE);
-
-        while (1) {
-            UINT count = 0;
-            EnterCriticalSection(&queueLock);
-            while (outBufferHead != outBufferTail && count < 64) {
-                batch[count++] = outBuffer[outBufferHead];
-                outBufferHead = (outBufferHead + 1) & OUT_BUFFER_MASK;
+            if (InterlockedCompareExchange(&g_mode, 0, 0) == MODE_ACTIVE) {
+                return 1;
             }
-            LeaveCriticalSection(&queueLock);
-
-            if (count == 0) break;
-            SendInput(count, batch, sizeof(INPUT));
         }
     }
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+DWORD WINAPI isolatedHookThreadProc(void* arg) {
+    (void)arg;
+    HHOOK hook = SetWindowsHookEx(WH_MOUSE_LL, IsolatedLowLevelMouseProc, GetModuleHandle(NULL), 0);
+    if (!hook) return -1;
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_QUIT) break;
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    UnhookWindowsHookEx(hook);
     return 0;
 }
 
-static inline void pushAbsoluteMove(int pixelX, int pixelY) {
-    if (vWidth <= 0 || vHeight <= 0) return;
+/* Non-blocking boundary calibration display */
+typedef struct {
+    int tlX, tlY, brX, brY;
+} BlinkParams;
 
-    INPUT ip = {0};
-    ip.type = INPUT_MOUSE;
-    ip.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-    // Map desktop space to normalized 0-65535 coordinates
-    ip.mi.dx = (LONG)(((int64_t)(pixelX - vLeft) * 65536) / vWidth);
-    ip.mi.dy = (LONG)(((int64_t)(pixelY - vTop) * 65536) / vHeight);
-    pushBuffer(&ip);
+DWORD WINAPI blinkAnimationThread(void* param) {
+    BlinkParams* p = (BlinkParams*)param;
+    SetCursorPos(p->tlX, p->tlY);
+    Sleep(50);
+    SetCursorPos(p->brX, p->tlY);
+    Sleep(50);
+    SetCursorPos(p->brX, p->brY);
+    Sleep(50);
+    SetCursorPos(p->tlX, p->brY);
+    Sleep(50);
+    SetCursorPos(p->tlX, p->tlY);
+    free(p);
+    return 0;
 }
 
-static inline void pressLeft(int down) {
-    INPUT ip = {0};
-    ip.type = INPUT_MOUSE;
-    ip.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
-    pushBuffer(&ip);
-}
-
-static inline void pressRight(int down) {
-    INPUT ip = {0};
-    ip.type = INPUT_MOUSE;
-    ip.mi.dwFlags = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
-    pushBuffer(&ip);
-}
-
-void showActivate(int state, int ms) {
-    pressLeft(0);
-    pressRight(0);
-    leftTouching = 0;
-    rightTouching = 0;
-    printf("\n>>> %s DRAWING MODE <<<\n", state ? "ENABLED" : "DISABLED");
+void triggerModeBlink(int state) {
+    pushButtonEvent(MOUSEEVENTF_LEFTUP);
+    pushButtonEvent(MOUSEEVENTF_RIGHTUP);
+    InterlockedExchange(&g_leftTouching, 0);
+    InterlockedExchange(&g_rightTouching, 0);
 
     if (state) {
-        pushAbsoluteMove(topLeftX, topLeftY);
-        Sleep(ms);
-        pushAbsoluteMove(bottomRightX, topLeftY);
-        Sleep(ms);
-        pushAbsoluteMove(bottomRightX, bottomRightY);
-        Sleep(ms);
-        pushAbsoluteMove(topLeftX, bottomRightY);
-        Sleep(ms);
-        pushAbsoluteMove(topLeftX, topLeftY);
+        BlinkParams* p = (BlinkParams*)malloc(sizeof(BlinkParams));
+        if (p) {
+            AcquireSRWLockShared(&g_cfgLock);
+            p->tlX = g_cfg.topLeftX;
+            p->tlY = g_cfg.topLeftY;
+            p->brX = g_cfg.bottomRightX;
+            p->brY = g_cfg.bottomRightY;
+            ReleaseSRWLockShared(&g_cfgLock);
+
+            HANDLE hBlink = CreateThread(NULL, 0, blinkAnimationThread, p, 0, NULL);
+            if (hBlink) CloseHandle(hBlink);
+            else free(p);
+        }
     }
 }
 
 void showConfigMenu(void);
 
 void handleKeyboard(USHORT code, USHORT flags) {
-    int down = (flags & 1) ^ 1; 
+    int down = (flags & 1) ^ 1;
 
-    if (code != 0 && code == keyMainMod)        downMainMod = down;
-    else if (code != 0 && code == keyQuickMod)  downQuickMod = down;
-    else if (code != 0 && code == keyLeftClick)  downLeftClick = down;
-    else if (code != 0 && code == keyRightClick) downRightClick = down;
-    else if (code != 0 && code == keyActivate)  downActivate = down;
-    else if (code != 0 && code == keySettings)  downSettings = down;
+    AcquireSRWLockShared(&g_cfgLock);
+    USHORT kMain  = g_cfg.keyMainMod;
+    USHORT kQuick = g_cfg.keyQuickMod;
+    USHORT kLeft  = g_cfg.keyLeftClick;
+    USHORT kRight = g_cfg.keyRightClick;
+    USHORT kAct   = g_cfg.keyActivate;
+    USHORT kSet   = g_cfg.keySettings;
+    ReleaseSRWLockShared(&g_cfgLock);
 
-    if (!down || inSettingsMenu) return;
+    if (code != 0 && code == kMain)        InterlockedExchange(&g_downMainMod, down);
+    else if (code != 0 && code == kQuick)  InterlockedExchange(&g_downQuickMod, down);
+    else if (code != 0 && code == kLeft)   InterlockedExchange(&g_downLeftClick, down);
+    else if (code != 0 && code == kRight)  InterlockedExchange(&g_downRightClick, down);
+    else if (code != 0 && code == kAct)    InterlockedExchange(&g_downActivate, down);
+    else if (code != 0 && code == kSet)    InterlockedExchange(&g_downSettings, down);
 
-    if (downMainMod && downSettings) {
-        if (mode == MODE_ACTIVE) {
-            setHookState(0);
-            showActivate(0, 50);
-            mode = MODE_NONE;
+    if (!down || InterlockedCompareExchange(&g_inSettingsMenu, 0, 0)) return;
+
+    LONG dMain  = InterlockedCompareExchange(&g_downMainMod, 0, 0);
+    LONG dQuick = InterlockedCompareExchange(&g_downQuickMod, 0, 0);
+    LONG dAct   = InterlockedCompareExchange(&g_downActivate, 0, 0);
+    LONG dSet   = InterlockedCompareExchange(&g_downSettings, 0, 0);
+    LONG curMode = InterlockedCompareExchange(&g_mode, 0, 0);
+
+    if (dMain && dSet) {
+        if (curMode == MODE_ACTIVE) {
+            triggerModeBlink(0);
+            InterlockedExchange(&g_mode, MODE_NONE);
         }
         showConfigMenu();
         return;
     }
 
-    if (downActivate && downMainMod && !downQuickMod) {
-        switch (mode) {
+    if (dAct && dMain && !dQuick) {
+        LONG cx = InterlockedCompareExchange(&g_cursorX, 0, 0);
+        LONG cy = InterlockedCompareExchange(&g_cursorY, 0, 0);
+        switch (curMode) {
             case MODE_NONE:
             case MODE_FIRST_TRACKPAD_CORNER:
-                topLeftX = mouseX; 
-                topLeftY = mouseY; 
-                mode = MODE_FIRST_SCREEN_CORNER; 
-                printf("\n[Calibrate Screen] Point 1: (%d, %d). Move to opposite corner & press shortcut again.\n", topLeftX, topLeftY);
+                AcquireSRWLockExclusive(&g_cfgLock);
+                g_cfg.topLeftX = cx;
+                g_cfg.topLeftY = cy;
+                ReleaseSRWLockExclusive(&g_cfgLock);
+                InterlockedExchange(&g_mode, MODE_FIRST_SCREEN_CORNER);
                 break;
-            case MODE_FIRST_SCREEN_CORNER: 
-                if (mouseX < topLeftX) { bottomRightX = topLeftX; topLeftX = mouseX; } 
-                else { bottomRightX = mouseX; } 
-                if (mouseY < topLeftY) { bottomRightY = topLeftY; topLeftY = mouseY; } 
-                else { bottomRightY = mouseY; } 
-                screenRegionDefined = 1; 
-                recalculateMappingFactors();
-                printf("[Calibrate Screen] Done: (%d,%d)-(%d,%d)\n", topLeftX, topLeftY, bottomRightX, bottomRightY);
-                saveSettings();
-                mode = MODE_NONE; 
+            case MODE_FIRST_SCREEN_CORNER:
+                AcquireSRWLockExclusive(&g_cfgLock);
+                if (cx < g_cfg.topLeftX) { g_cfg.bottomRightX = g_cfg.topLeftX; g_cfg.topLeftX = cx; }
+                else { g_cfg.bottomRightX = cx; }
+                if (cy < g_cfg.topLeftY) { g_cfg.bottomRightY = g_cfg.topLeftY; g_cfg.topLeftY = cy; }
+                else { g_cfg.bottomRightY = cy; }
+                ReleaseSRWLockExclusive(&g_cfgLock);
+                saveSettingsAsync();
+                InterlockedExchange(&g_mode, MODE_NONE);
                 break;
-            case MODE_ACTIVE: 
-                setHookState(0);
-                showActivate(0, 100); 
-                mode = MODE_NONE; 
+            case MODE_ACTIVE:
+                triggerModeBlink(0);
+                InterlockedExchange(&g_mode, MODE_NONE);
                 break;
         }
-    } 
-    else if (downActivate && downMainMod && downQuickMod) {
-        switch (mode) {
+    } else if (dAct && dMain && dQuick) {
+        LONG rx = InterlockedCompareExchange(&g_latestRawX, 0, 0);
+        LONG ry = InterlockedCompareExchange(&g_latestRawY, 0, 0);
+        switch (curMode) {
             case MODE_NONE:
             case MODE_FIRST_SCREEN_CORNER:
-                if (rawX != -1 && rawY != -1) { 
-                    trackpadTopLeftX = rawX; 
-                    trackpadTopLeftY = rawY; 
-                    mode = MODE_FIRST_TRACKPAD_CORNER; 
-                    printf("\n[Calibrate Trackpad] Point 1: (%ld, %ld). Place finger on corner & press again.\n", rawX, rawY);
+                if (rx != -1 && ry != -1) {
+                    AcquireSRWLockExclusive(&g_cfgLock);
+                    g_cfg.trackpadTopLeftX = rx;
+                    g_cfg.trackpadTopLeftY = ry;
+                    ReleaseSRWLockExclusive(&g_cfgLock);
+                    InterlockedExchange(&g_mode, MODE_FIRST_TRACKPAD_CORNER);
                 }
                 break;
-            case MODE_FIRST_TRACKPAD_CORNER: 
-                if (rawX != -1 && rawY != -1) { 
-                    if (rawX < trackpadTopLeftX) { trackpadBottomRightX = trackpadTopLeftX; trackpadTopLeftX = rawX; } 
-                    else { trackpadBottomRightX = rawX; } 
-                    if (rawY < trackpadTopLeftY) { trackpadBottomRightY = trackpadTopLeftY; trackpadTopLeftY = rawY; } 
-                    else { trackpadBottomRightY = rawY; } 
-                    if (trackpadBottomRightX <= trackpadTopLeftX || trackpadBottomRightY <= trackpadTopLeftY) { 
-                        puts("[Error] Trackpad boundaries zero or inverted.");
+            case MODE_FIRST_TRACKPAD_CORNER:
+                if (rx != -1 && ry != -1) {
+                    AcquireSRWLockExclusive(&g_cfgLock);
+                    if (rx < g_cfg.trackpadTopLeftX) {
+                        g_cfg.trackpadBottomRightX = g_cfg.trackpadTopLeftX;
+                        g_cfg.trackpadTopLeftX = rx;
                     } else {
-                        trackpadRegionDefined = 1; 
-                        recalculateMappingFactors();
-                        printf("[Calibrate Trackpad] Done: (%ld,%ld)-(%ld,%ld)\n", trackpadTopLeftX, trackpadTopLeftY, trackpadBottomRightX, trackpadBottomRightY);
-                        saveSettings();
+                        g_cfg.trackpadBottomRightX = rx;
                     }
-                    mode = MODE_NONE; 
+                    if (ry < g_cfg.trackpadTopLeftY) {
+                        g_cfg.trackpadBottomRightY = g_cfg.trackpadTopLeftY;
+                        g_cfg.trackpadTopLeftY = ry;
+                    } else {
+                        g_cfg.trackpadBottomRightY = ry;
+                    }
+                    ReleaseSRWLockExclusive(&g_cfgLock);
+                    saveSettingsAsync();
+                    InterlockedExchange(&g_mode, MODE_NONE);
                 }
                 break;
-            case MODE_ACTIVE: 
-                setHookState(0);
-                showActivate(0, 100); 
-                mode = MODE_NONE; 
+            case MODE_ACTIVE:
+                triggerModeBlink(0);
+                InterlockedExchange(&g_mode, MODE_NONE);
                 break;
         }
-    } 
-    else if (downActivate && downQuickMod && !downMainMod) {
-        if (mode == MODE_ACTIVE) { 
-            setHookState(0);
-            showActivate(0, 100); 
-            mode = MODE_NONE; 
+    } else if (dAct && dQuick && !dMain) {
+        if (curMode == MODE_ACTIVE) {
+            triggerModeBlink(0);
+            InterlockedExchange(&g_mode, MODE_NONE);
         } else {
-            if (screenRegionDefined && trackpadRegionDefined) { 
-                mode = MODE_ACTIVE; 
-                leftTouching = 0;
-                rightTouching = 0;
-                setHookState(1);
-                showActivate(1, 150); 
-            }
+            InterlockedExchange(&g_mode, MODE_ACTIVE);
+            triggerModeBlink(1);
         }
     }
 }
 
-LRESULT CALLBACK EventHandler(HWND hwnd, unsigned event, WPARAM wparam, LPARAM lparam) {
+LRESULT CALLBACK RawInputWndProc(HWND hwnd, unsigned event, WPARAM wparam, LPARAM lparam) {
     static BYTE rawinputBuffer[sizeof(RAWINPUT) + IN_BUFFER_SIZE];
-    static USAGE usages[32];
+    static USAGE usages[64];
 
     switch (event) {
         case WM_DISPLAYCHANGE:
             updateScreenMetrics();
             return 0;
 
-        case WM_DESTROY: 
-            PostQuitMessage(0); 
-            return 0; 
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
 
-        case WM_INPUT: { 
-            UINT size = sizeof(rawinputBuffer); 
-            if (GetRawInputData((HRAWINPUT)lparam, RID_INPUT, rawinputBuffer, &size, sizeof(RAWINPUTHEADER)) == (UINT)-1) 
-                return 0; 
+        case WM_INPUT: {
+            UINT size = sizeof(rawinputBuffer);
+            if (GetRawInputData((HRAWINPUT)lparam, RID_INPUT, rawinputBuffer, &size, sizeof(RAWINPUTHEADER)) == (UINT)-1)
+                return 0;
 
-            RAWINPUT* data = (RAWINPUT*)rawinputBuffer; 
-            if (data->header.dwType == RIM_TYPEKEYBOARD) { 
-                handleKeyboard(data->data.keyboard.MakeCode, data->data.keyboard.Flags); 
-                return 0; 
+            RAWINPUT* data = (RAWINPUT*)rawinputBuffer;
+            if (data->header.dwType == RIM_TYPEKEYBOARD) {
+                handleKeyboard(data->data.keyboard.MakeCode, data->data.keyboard.Flags);
+                return 0;
             }
 
-            if (data->header.dwType != RIM_TYPEHID) 
+            if (data->header.dwType != RIM_TYPEHID)
                 return 0;
 
             PHIDP_PREPARSED_DATA preparsed = getOrCachePreparsed(data->header.hDevice);
             if (!preparsed) return 0;
 
-            ULONG usageValue;
-            if (HidP_GetUsageValue(HidP_Input, 0x01, 0, 0x30, &usageValue, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) { 
-                rawX = (long)usageValue; 
-            }
-            if (HidP_GetUsageValue(HidP_Input, 0x01, 0, 0x31, &usageValue, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) { 
-                rawY = (long)usageValue; 
-            }
+            ULONG contactCount = 1;
+            HidP_GetUsageValue(HidP_Input, 0x0D, 0, 0x54, &contactCount, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid);
 
-            if (mode != MODE_ACTIVE || inSettingsMenu) 
-                return 0; 
+            ULONG contactId = 0;
+            HidP_GetUsageValue(HidP_Input, 0x0D, 0, 0x51, &contactId, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid);
 
-            ULONG usageLength = sizeof(usages) / sizeof(USAGE); 
-            int touch_detected = 0; 
-            if (HidP_GetUsages(HidP_Input, 0x0D, 0, usages, &usageLength, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) { 
-                for (ULONG j = 0; j < usageLength; j++) { 
-                    if (usages[j] == 0x42) { // Tip Switch
-                        touch_detected = 1; 
-                        break; 
+            ULONG usageLength = sizeof(usages) / sizeof(USAGE);
+            int tipSwitch = 0;
+            if (HidP_GetUsages(HidP_Input, 0x0D, 0, usages, &usageLength, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) {
+                for (ULONG j = 0; j < usageLength; j++) {
+                    if (usages[j] == 0x42) {
+                        tipSwitch = 1;
+                        break;
                     }
                 }
             }
 
-            int left_down = 0;
-            if (keyLeftClick != 0) {
-                if (fnMode == FN_MODE_DOWN)        left_down = downLeftClick; 
-                else if (fnMode == FN_MODE_LIFT)   left_down = touch_detected && !downLeftClick; 
-                else                               left_down = touch_detected; 
+            LONG lockedId = InterlockedCompareExchange(&g_activeContactId, -1, -1);
+            if (tipSwitch) {
+                if (lockedId == -1) {
+                    InterlockedExchange(&g_activeContactId, contactId);
+                    lockedId = (LONG)contactId;
+                }
             } else {
-                left_down = (fnMode == FN_MODE_NONE) ? touch_detected : 0;
+                if (lockedId == (LONG)contactId) {
+                    InterlockedExchange(&g_activeContactId, -1);
+                    lockedId = -1;
+                }
             }
 
-            int right_down = (keyRightClick != 0) ? downRightClick : 0;
-
-            if (trackpadRegionDefined && screenRegionDefined && rawX != -1 && rawY != -1) { 
-                long rx = rawX < trackpadTopLeftX ? trackpadTopLeftX : (rawX > trackpadBottomRightX ? trackpadBottomRightX : rawX);
-                long ry = rawY < trackpadTopLeftY ? trackpadTopLeftY : (rawY > trackpadBottomRightY ? trackpadBottomRightY : rawY);
-
-                int x = topLeftX + (int)((((int64_t)(rx - trackpadTopLeftX) * mapScaleX) + 0x8000) >> 16);
-                int y = topLeftY + (int)((((int64_t)(ry - trackpadTopLeftY) * mapScaleY) + 0x8000) >> 16);
-
-                pushAbsoluteMove(x, y);
+            if (lockedId != -1 && lockedId != (LONG)contactId) {
+                return 0;
             }
 
-            if (left_down != leftTouching) { 
-                pressLeft(left_down); 
-                leftTouching = left_down; 
+            ULONG rawValX = 0, rawValY = 0;
+            if (HidP_GetUsageValue(HidP_Input, 0x01, 0, 0x30, &rawValX, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) {
+                InterlockedExchange(&g_latestRawX, (LONG)rawValX);
             }
-            if (right_down != rightTouching) { 
-                pressRight(right_down); 
-                rightTouching = right_down; 
+            if (HidP_GetUsageValue(HidP_Input, 0x01, 0, 0x31, &rawValY, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) {
+                InterlockedExchange(&g_latestRawY, (LONG)rawValY);
             }
 
-            return 0; 
+            if (InterlockedCompareExchange(&g_mode, 0, 0) != MODE_ACTIVE ||
+                InterlockedCompareExchange(&g_inSettingsMenu, 0, 0)) {
+                return 0;
+            }
+
+            LONG rx = InterlockedCompareExchange(&g_latestRawX, -1, -1);
+            LONG ry = InterlockedCompareExchange(&g_latestRawY, -1, -1);
+
+            AcquireSRWLockShared(&g_cfgLock);
+            int64_t tpMinX = g_cfg.trackpadTopLeftX;
+            int64_t tpMinY = g_cfg.trackpadTopLeftY;
+            int64_t tpMaxX = g_cfg.trackpadBottomRightX;
+            int64_t tpMaxY = g_cfg.trackpadBottomRightY;
+
+            int32_t sTopLeftX = g_cfg.topLeftX;
+            int32_t sTopLeftY = g_cfg.topLeftY;
+            int64_t sW = (int64_t)g_cfg.bottomRightX - sTopLeftX;
+            int64_t sH = (int64_t)g_cfg.bottomRightY - sTopLeftY;
+
+            USHORT leftKey = g_cfg.keyLeftClick;
+            USHORT rightKey = g_cfg.keyRightClick;
+            int32_t fnMode = g_cfg.fnMode;
+            ReleaseSRWLockShared(&g_cfgLock);
+
+            if (rx != -1 && ry != -1 && tipSwitch) {
+                int64_t tpW = tpMaxX - tpMinX;
+                int64_t tpH = tpMaxY - tpMinY;
+                if (tpW <= 0) tpW = 1;
+                if (tpH <= 0) tpH = 1;
+
+                int64_t clX = rx < tpMinX ? tpMinX : (rx > tpMaxX ? tpMaxX : rx);
+                int64_t clY = ry < tpMinY ? tpMinY : (ry > tpMaxY ? tpMaxY : ry);
+
+                int pixelX = sTopLeftX + (int)(( (clX - tpMinX) * sW ) / tpW);
+                int pixelY = sTopLeftY + (int)(( (clY - tpMinY) * sH ) / tpH);
+
+                /* Zero-latency direct cursor repositioning */
+                SetCursorPos(pixelX, pixelY);
+            }
+
+            int leftDown = 0;
+            LONG dLeft = InterlockedCompareExchange(&g_downLeftClick, 0, 0);
+            if (leftKey != 0) {
+                if (fnMode == FN_MODE_DOWN)        leftDown = dLeft;
+                else if (fnMode == FN_MODE_LIFT)   leftDown = tipSwitch && !dLeft;
+                else                               leftDown = tipSwitch;
+            } else {
+                leftDown = (fnMode == FN_MODE_NONE) ? tipSwitch : 0;
+            }
+
+            int rightDown = (rightKey != 0) ? (int)InterlockedCompareExchange(&g_downRightClick, 0, 0) : 0;
+
+            if (leftDown != InterlockedCompareExchange(&g_leftTouching, 0, 0)) {
+                pushButtonEvent(leftDown ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP);
+                InterlockedExchange(&g_leftTouching, leftDown);
+            }
+            if (rightDown != InterlockedCompareExchange(&g_rightTouching, 0, 0)) {
+                pushButtonEvent(rightDown ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP);
+                InterlockedExchange(&g_rightTouching, rightDown);
+            }
+
+            return 0;
         }
     }
-    return DefWindowProc(hwnd, event, wparam, lparam); 
+    return DefWindowProc(hwnd, event, wparam, lparam);
 }
 
 static void getKeyDisplayString(USHORT code, char* outBuf, size_t outSize) {
@@ -508,7 +579,6 @@ static void getKeyDisplayString(USHORT code, char* outBuf, size_t outSize) {
         snprintf(outBuf, outSize, "[Unbound / Disabled]");
         return;
     }
-
     switch (code) {
         case 0x01: snprintf(outBuf, outSize, "Escape (0x01)"); return;
         case 0x18: snprintf(outBuf, outSize, "O (0x18)"); return;
@@ -517,7 +587,6 @@ static void getKeyDisplayString(USHORT code, char* outBuf, size_t outSize) {
         case 0x5B: snprintf(outBuf, outSize, "Left Win (0x5B)"); return;
         case 0x29: snprintf(outBuf, outSize, "Backtick ` (0x29)"); return;
     }
-
     LONG lParam = (LONG)code << 16;
     char name[64] = {0};
     if (GetKeyNameTextA(lParam, name, sizeof(name)) > 0) {
@@ -534,31 +603,35 @@ static void printKeybind(const char* label, USHORT code) {
 }
 
 void printBanner(void) {
+    AcquireSRWLockShared(&g_cfgLock);
+    AppConfig snap = g_cfg;
+    ReleaseSRWLockShared(&g_cfgLock);
+
     char strMain[64], strQuick[64], strAct[64], strSet[64];
-    getKeyDisplayString(keyMainMod, strMain, sizeof(strMain));
-    getKeyDisplayString(keyQuickMod, strQuick, sizeof(strQuick));
-    getKeyDisplayString(keyActivate, strAct, sizeof(strAct));
-    getKeyDisplayString(keySettings, strSet, sizeof(strSet));
+    getKeyDisplayString(snap.keyMainMod, strMain, sizeof(strMain));
+    getKeyDisplayString(snap.keyQuickMod, strQuick, sizeof(strQuick));
+    getKeyDisplayString(snap.keyActivate, strAct, sizeof(strAct));
+    getKeyDisplayString(snap.keySettings, strSet, sizeof(strSet));
 
     puts("===================================================================");
-    puts("              Precision Trackpad Mapper                            ");
+    puts("              Precision Trackpad Mapper (Ultra-Fast)               ");
     puts("===================================================================");
     puts(" Current Bindings:");
-    printKeybind("[Main Modifier]", keyMainMod);
-    printKeybind("[Quick Modifier]", keyQuickMod);
-    printKeybind("[Activate Key]", keyActivate);
-    printKeybind("[Settings Key]", keySettings);
-    printKeybind("[Left Click / Fn]", keyLeftClick);
-    printKeybind("[Right Click]", keyRightClick);
+    printKeybind("[Main Modifier]", snap.keyMainMod);
+    printKeybind("[Quick Modifier]", snap.keyQuickMod);
+    printKeybind("[Activate Key]", snap.keyActivate);
+    printKeybind("[Settings Key]", snap.keySettings);
+    printKeybind("[Left Click / Fn]", snap.keyLeftClick);
+    printKeybind("[Right Click]", snap.keyRightClick);
     puts(" Operational Hotkeys:");
     printf("   Open Settings     : %s + %s\n", strMain, strSet);
     printf("   Define Screen Box : %s + %s\n", strMain, strAct);
     printf("   Define Trackpad   : %s + %s + %s\n", strMain, strQuick, strAct);
     printf("   Toggle Mode       : %s + %s\n", strQuick, strAct);
     puts("-------------------------------------------------------------------");
-    printf(" Status: Screen (%d,%d)-(%d,%d) | Trackpad (%ld,%ld)-(%ld,%ld)\n",
-           topLeftX, topLeftY, bottomRightX, bottomRightY,
-           trackpadTopLeftX, trackpadTopLeftY, trackpadBottomRightX, trackpadBottomRightY);
+    printf(" Status: Screen (%d,%d)-(%d,%d) | Trackpad (%lld,%lld)-(%lld,%lld)\n",
+           snap.topLeftX, snap.topLeftY, snap.bottomRightX, snap.bottomRightY,
+           snap.trackpadTopLeftX, snap.trackpadTopLeftY, snap.trackpadBottomRightX, snap.trackpadBottomRightY);
     puts("===================================================================");
 }
 
@@ -573,15 +646,19 @@ void captureKeybind(const char* actionName, USHORT* targetKey) {
         for (int vk = 8; vk <= 255; vk++) {
             if (GetAsyncKeyState(vk) & 0x8000) {
                 if (vk == VK_ESCAPE) {
+                    AcquireSRWLockExclusive(&g_cfgLock);
                     *targetKey = 0;
-                    printf("[%s] has been unbound / disabled.\n", actionName);
+                    ReleaseSRWLockExclusive(&g_cfgLock);
+                    printf("[%s] unbound.\n", actionName);
                     while (GetAsyncKeyState(vk) & 0x8000) Sleep(10);
                     Sleep(200);
                     return;
                 }
                 UINT scancode = MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
                 if (scancode != 0) {
+                    AcquireSRWLockExclusive(&g_cfgLock);
                     *targetKey = (USHORT)scancode;
+                    ReleaseSRWLockExclusive(&g_cfgLock);
                     char keyText[64];
                     getKeyDisplayString(*targetKey, keyText, sizeof(keyText));
                     printf("Assigned %s to [%s].\n", keyText, actionName);
@@ -596,7 +673,7 @@ void captureKeybind(const char* actionName, USHORT* targetKey) {
 }
 
 void showConfigMenu(void) {
-    inSettingsMenu = 1;
+    InterlockedExchange(&g_inSettingsMenu, 1);
     char choice[16];
     while (1) {
         system("cls");
@@ -610,7 +687,7 @@ void showConfigMenu(void) {
         puts(" 6. Rebind [Right Click Key]");
         puts(" 7. Calibrate Trackpad Manually");
         puts(" 8. Switch Pen Mode (Down / Lift / None)");
-        puts(" 9. Save Current Settings to INI");
+        puts(" 9. Save Current Settings (Binary)");
         puts(" 10. Return to Mapping Service");
         puts(" 11. Exit Program");
         printf("\nSelect an option [1-11]: ");
@@ -619,20 +696,20 @@ void showConfigMenu(void) {
         int opt = atoi(choice);
 
         switch (opt) {
-            case 1: captureKeybind("Main Modifier", &keyMainMod); break;
-            case 2: captureKeybind("Quick Modifier", &keyQuickMod); break;
-            case 3: captureKeybind("Activate Key", &keyActivate); break;
-            case 4: captureKeybind("Settings Key", &keySettings); break;
-            case 5: captureKeybind("Left Click / Fn Key", &keyLeftClick); break;
-            case 6: captureKeybind("Right Click Key", &keyRightClick); break;
+            case 1: captureKeybind("Main Modifier", &g_cfg.keyMainMod); break;
+            case 2: captureKeybind("Quick Modifier", &g_cfg.keyQuickMod); break;
+            case 3: captureKeybind("Activate Key", &g_cfg.keyActivate); break;
+            case 4: captureKeybind("Settings Key", &g_cfg.keySettings); break;
+            case 5: captureKeybind("Left Click / Fn Key", &g_cfg.keyLeftClick); break;
+            case 6: captureKeybind("Right Click Key", &g_cfg.keyRightClick); break;
             case 7: {
-                long x1, y1, x2, y2;
+                long long x1, y1, x2, y2;
                 printf("Enter trackpad bounds (minX minY maxX maxY): ");
-                if (scanf("%ld %ld %ld %ld", &x1, &y1, &x2, &y2) == 4 && x1 < x2 && y1 < y2) { 
-                    trackpadTopLeftX = x1; trackpadTopLeftY = y1; 
-                    trackpadBottomRightX = x2; trackpadBottomRightY = y2; 
-                    trackpadRegionDefined = 1; 
-                    recalculateMappingFactors();
+                if (scanf("%lld %lld %lld %lld", &x1, &y1, &x2, &y2) == 4 && x1 < x2 && y1 < y2) {
+                    AcquireSRWLockExclusive(&g_cfgLock);
+                    g_cfg.trackpadTopLeftX = x1; g_cfg.trackpadTopLeftY = y1;
+                    g_cfg.trackpadBottomRightX = x2; g_cfg.trackpadBottomRightY = y2;
+                    ReleaseSRWLockExclusive(&g_cfgLock);
                     puts("Trackpad boundaries updated.");
                 } else {
                     puts("Invalid values entered.");
@@ -641,27 +718,31 @@ void showConfigMenu(void) {
                 break;
             }
             case 8: {
-                fnMode = (fnMode + 1) % 3;
-                printf("Fn mode changed to: %s\n", 
-                    fnMode == FN_MODE_DOWN ? "FN_MODE_DOWN" : (fnMode == FN_MODE_LIFT ? "FN_MODE_LIFT" : "FN_MODE_NONE"));
-                Sleep(400);
+                AcquireSRWLockExclusive(&g_cfgLock);
+                g_cfg.fnMode = (g_cfg.fnMode + 1) % 3;
+                ReleaseSRWLockExclusive(&g_cfgLock);
+                printf("Fn mode changed.\n");
+                Sleep(300);
                 break;
             }
             case 9:
-                saveSettings();
-                Sleep(300);
+                saveSettingsAsync();
+                Sleep(200);
                 break;
             case 10:
-                saveSettings();
-                inSettingsMenu = 0;
-                downMainMod = downQuickMod = downActivate = downSettings = 0;
+                saveSettingsAsync();
+                InterlockedExchange(&g_downMainMod, 0);
+                InterlockedExchange(&g_downQuickMod, 0);
+                InterlockedExchange(&g_downActivate, 0);
+                InterlockedExchange(&g_downSettings, 0);
+                InterlockedExchange(&g_inSettingsMenu, 0);
                 system("cls");
                 printBanner();
                 puts("\n[Engine Running] Listening for inputs. Press Ctrl+C in this window to quit.");
                 return;
             case 11:
-                InterlockedExchange(&running, 0);
-                if (g_hWnd) PostMessage(g_hWnd, WM_CLOSE, 0, 0);
+                InterlockedExchange(&g_running, 0);
+                if (g_hMsgWnd) PostMessage(g_hMsgWnd, WM_CLOSE, 0, 0);
                 return;
             default:
                 break;
@@ -671,9 +752,9 @@ void showConfigMenu(void) {
 
 static BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType) {
     (void)dwCtrlType;
-    InterlockedExchange(&running, 0);
-    setHookState(0);
-    if (g_hWnd) PostMessage(g_hWnd, WM_CLOSE, 0, 0);
+    InterlockedExchange(&g_running, 0);
+    if (g_hookThreadId) PostThreadMessage(g_hookThreadId, WM_QUIT, 0, 0);
+    if (g_hMsgWnd) PostMessage(g_hMsgWnd, WM_CLOSE, 0, 0);
     return TRUE;
 }
 
@@ -685,60 +766,66 @@ int main(int argc, char* argv[]) {
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
     updateScreenMetrics();
 
-    topLeftX = vLeft;
-    topLeftY = vTop;
-    bottomRightX = topLeftX + vWidth;
-    bottomRightY = topLeftY + vHeight;
+    AcquireSRWLockExclusive(&g_cfgLock);
+    g_cfg.topLeftX = g_vLeft;
+    g_cfg.topLeftY = g_vTop;
+    g_cfg.bottomRightX = g_vLeft + g_vWidth;
+    g_cfg.bottomRightY = g_vTop + g_vHeight;
+    ReleaseSRWLockExclusive(&g_cfgLock);
 
     loadSettings();
-    InitializeCriticalSection(&queueLock);
+    g_hWorkerWakeEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+
+    g_hWorkerThread = CreateThread(NULL, 0, workerThreadProc, NULL, 0, NULL);
+    if (!g_hWorkerThread) return -1;
+    SetThreadPriority(g_hWorkerThread, THREAD_PRIORITY_HIGHEST);
+
+    g_hHookThread = CreateThread(NULL, 0, isolatedHookThreadProc, NULL, 0, &g_hookThreadId);
+    if (!g_hHookThread) return -1;
+    SetThreadPriority(g_hHookThread, THREAD_PRIORITY_HIGHEST);
 
     WNDCLASS window_class = {0};
-    window_class.lpfnWndProc = EventHandler;
+    window_class.lpfnWndProc = RawInputWndProc;
     window_class.hInstance = GetModuleHandle(NULL);
     window_class.lpszClassName = class_name;
-    if (!RegisterClass(&window_class)) return -1; 
+    if (!RegisterClass(&window_class)) return -1;
 
-    g_hWnd = CreateWindow(class_name, "Precision Trackpad Engine", 0, 0, 0, 0, 0, HWND_MESSAGE, 0, 0, 0); 
-    if (!g_hWnd) return -1; 
+    g_hMsgWnd = CreateWindow(class_name, "Precision Trackpad Engine", 0, 0, 0, 0, 0, HWND_MESSAGE, 0, 0, 0);
+    if (!g_hMsgWnd) return -1;
 
-    // Register Touchpad and Keyboard devices safely
     RAWINPUTDEVICE rid[2];
-    rid[0].usUsagePage = 0x0D; 
+    rid[0].usUsagePage = 0x0D;
     rid[0].usUsage     = 0x05;             // Touchpad
-    rid[0].dwFlags     = RIDEV_INPUTSINK; 
-    rid[0].hwndTarget  = g_hWnd; 
+    rid[0].dwFlags     = RIDEV_INPUTSINK;
+    rid[0].hwndTarget  = g_hMsgWnd;
 
-    rid[1].usUsagePage = 0x01; 
+    rid[1].usUsagePage = 0x01;
     rid[1].usUsage     = 0x06;             // Keyboard
-    rid[1].dwFlags     = RIDEV_INPUTSINK;  // FIXED: Removed RIDEV_NOLEGACY
-    rid[1].hwndTarget  = g_hWnd; 
+    rid[1].dwFlags     = RIDEV_INPUTSINK;
+    rid[1].hwndTarget  = g_hMsgWnd;
 
     if (!RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) return -1;
-
-    queueReady = CreateEvent(NULL, FALSE, FALSE, NULL); 
-    g_hWorkerThread = CreateThread(NULL, 0, handleQueue, NULL, 0, NULL); 
-    if (!g_hWorkerThread) return -1; 
 
     system("cls");
     printBanner();
     puts("\n[Engine Running] Listening for inputs. Press Ctrl+C in this window to quit.");
 
     MSG message;
-    while (InterlockedCompareExchange(&running, 1, 1) && GetMessage(&message, NULL, 0, 0)) { 
-        TranslateMessage(&message); 
-        DispatchMessage(&message); 
+    while (InterlockedCompareExchange(&g_running, 1, 1) && GetMessage(&message, NULL, 0, 0)) {
+        TranslateMessage(&message);
+        DispatchMessage(&message);
     }
 
-    // Teardown
-    InterlockedExchange(&running, 0);
-    setHookState(0);
-    SetEvent(queueReady); 
-    WaitForSingleObject(g_hWorkerThread, 500); 
+    InterlockedExchange(&g_running, 0);
+    if (g_hookThreadId) PostThreadMessage(g_hookThreadId, WM_QUIT, 0, 0);
+    SetEvent(g_hWorkerWakeEvent);
 
-    CloseHandle(g_hWorkerThread); 
-    CloseHandle(queueReady); 
-    DeleteCriticalSection(&queueLock);
+    WaitForSingleObject(g_hWorkerThread, 500);
+    WaitForSingleObject(g_hHookThread, 500);
+
+    CloseHandle(g_hWorkerThread);
+    CloseHandle(g_hHookThread);
+    CloseHandle(g_hWorkerWakeEvent);
 
     for (int i = 0; i < g_deviceCacheCount; i++) {
         if (g_deviceCache[i].preparsed) {
@@ -746,5 +833,5 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    return 0; 
+    return 0;
 }

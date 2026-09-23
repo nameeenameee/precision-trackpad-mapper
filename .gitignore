@@ -3,6 +3,7 @@
 *.obj
 *.o
 *.ini
+*.bin
 
 # Local editor and debugger files
 .vscode/
