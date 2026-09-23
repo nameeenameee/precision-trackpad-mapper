@@ -565,7 +565,7 @@ void promptTrackpadRegion(void) {
 
 void help() {
     MessageBox(0,
-"finger-draw [options]\n"
+"precision-trackpad-mapper [options]\n"
 "\n"
 "Options:\n"
 "--help                 : this message\n"
@@ -722,7 +722,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE hPrevInstance,
          return -1;
     }
 
-    puts("--- finger-draw ---");
+    puts("--- precision-trackpad-mapper ---");
     puts("1. Define Screen Area: Press Ctrl+Win at top-left, then again at bottom-right.");
     puts("   (Defaults to full screen if skipped)");
     puts("2. Define Trackpad Area: use --trackpad option, interactive prompt, or Ctrl+Alt+Win while touching.");
