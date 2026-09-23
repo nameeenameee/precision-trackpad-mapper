@@ -1,60 +1,52 @@
 # Precision Trackpad Mapper (PTM)
 
-Turn your Windows Precision Touchpad into a low-latency, absolute-positioning tablet surface — designed for *osu!* and fast desktop navigation without requiring a physical graphics tablet.
+Map your Windows Precision Touchpad directly to screen coordinates, turning it into an absolute-positioning input surface for *osu!* and desktop navigation.
 
-Standard laptop touchpads use relative movement with OS pointer acceleration. **Precision Trackpad Mapper** captures raw hardware coordinates and maps the touchpad area directly to your monitor bounds (1:1 absolute positioning).
+Standard laptop trackpads output relative mouse deltas with software acceleration. PTM reads raw digitizer contacts via Windows Raw Input APIs and snaps the cursor directly to the mapped screen bounds—similar to a graphics tablet.
 
 ---
 
 ## Features
 
-- **Absolute 1:1 Mapping:** The top-left of your touchpad is the top-left of your screen.
-- **Low Latency Raw Input:** Bypasses standard Windows pointer ballistics and mouse acceleration via `WM_INPUT`.
-- **Built for osu!:** Instantaneous cursor tracking while tapping keys (`Z`/`X`) on your keyboard.
-- **Minimal & Portable:** Single self-contained Windows executable with zero runtime dependencies.
+- **1:1 Absolute Mapping:** Screen corners correspond directly to trackpad corners.
+- **No Acceleration:** Bypasses Windows pointer ballistics for linear tracking.
+- **Built for osu!:** Aim with your trackpad hand while tapping keys (`Z`/`X`) on the keyboard.
+- **Zero Dependencies:** Single compiled C binary using native Win32/HID libraries.
 
 ---
 
-## Quick Start
+## Setup & Configuration
 
-1. Download the latest binary (`precision-trackpad-mapper.exe`) from the [Releases](https://github.com/nameeenameee/precision-trackpad-mapper/releases) section.
-2. Run the executable.
-3. **Recommended Windows Settings:**
-   - Go to **Windows Settings → Bluetooth & devices → Touchpad**.
-   - Disable multi-finger gestures (three-finger and four-finger taps/swipes) to avoid accidental desktop switches during gameplay.
-4. Close the console window or press `Esc` / `Ctrl+C` to stop tracking.
+1. Download `precision-trackpad-mapper.exe` from [Releases](https://github.com/nameeenameee/precision-trackpad-mapper/releases).
+2. **Windows Touchpad Settings:**
+   - Open **Settings → Bluetooth & devices → Touchpad**.
+   - Turn off **"Tap with a single finger to single-click"** (prevents errant clicks while hovering/aiming).
+   - Disable multi-finger swipes and gestures to avoid accidental desktop switches mid-song.
+3. **In-game *osu!* Settings:**
+   - **Disable Raw Input** inside *osu!* (PTM drives the Windows OS cursor; in-game raw input reads mouse deltas directly and will cause erratic jumping).
+   - Set in-game mouse sensitivity strictly to **1.0x**.
+4. Run `precision-trackpad-mapper.exe`. Press `Esc` or `Ctrl+C` in the console window to stop.
 
 ---
 
 ## Building from Source
 
-### Prerequisites
-
-- GCC (MinGW-w64) or MSVC on Windows
-
-### Build with GCC / MinGW
+Requires GCC (MinGW-w64) or MSVC on Windows.
 
 ```bash
 gcc -O3 -o precision-trackpad-mapper.exe finger-draw.c -luser32 -lgdi32 -lhid
 ```
 
-*(If using a Makefile, update the target binary name to `precision-trackpad-mapper.exe` and run `make`).*
+---
+
+## Anticheat & Safety
+
+PTM uses documented Win32 Raw Input and cursor placement APIs. It does not hook processes, inject DLLs, or inspect/modify game memory.
 
 ---
 
-## Anticheat & Safety Notice
-
-This utility works exclusively through standard, documented Windows Raw Input APIs to read touch positions and update the cursor coordinates. It does not inject code, hook system libraries, or touch the memory of *osu!* or any other process.
-
----
-
-## Credits & License
+## Attribution & License
 
 Distributed under the MIT License. See `LICENSE` for details.
 
-This project is built upon the raw Windows Precision Touchpad capture foundation from [finger-draw](https://github.com/arpruss/finger-draw) by Alexander Pruss, modified and repurposed for everyday desktop control and rhythm gaming.
-
-# Stage, commit, and push changes
-git add LICENSE README.md Makefile
-git commit -m "docs: update branding, attribution, and documentation for precision-trackpad-mapper"
-git push origin main
+Based on the raw Precision Touchpad capture implementation in [finger-draw](https://github.com/arpruss/finger-draw) by arpruss
