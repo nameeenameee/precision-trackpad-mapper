@@ -53,7 +53,6 @@ This utility works exclusively through standard, documented Windows Raw Input AP
 Distributed under the MIT License. See `LICENSE` for details.
 
 This project is built upon the raw Windows Precision Touchpad capture foundation from [finger-draw](https://github.com/arpruss/finger-draw) by Alexander Pruss, modified and repurposed for everyday desktop control and rhythm gaming.
-EOF
 
 # Stage, commit, and push changes
 git add LICENSE README.md Makefile
