@@ -1,0 +1,8 @@
+# Build artifacts
+*.exe
+*.obj
+*.o
+
+# Local editor and debugger files
+.vscode/
+launch.json

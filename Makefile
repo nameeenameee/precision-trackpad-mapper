@@ -1,17 +1,18 @@
-CC ?= x86_64-w64-mingw32-gcc
-CFLAGS ?= -O2
+CC ?= gcc
+CFLAGS ?= -O3 -s
 CPPFLAGS ?=
 LDFLAGS ?= -mconsole
-LDLIBS ?= -lhid -lsetupapi
+LDLIBS ?= -luser32 -lgdi32 -lhid -lsetupapi
 
-TARGET := finger-draw.exe
+TARGET := precision-trackpad-mapper.exe
+SRC := precision-trackpad-mapper.c
 
 .PHONY: all clean
 
 all: $(TARGET)
 
-$(TARGET): finger-draw.c
+$(TARGET): $(SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 clean:
-	rm -f $(TARGET) *.obj
+	rm -f $(TARGET) *.o *.obj

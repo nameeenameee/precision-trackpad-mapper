@@ -35,7 +35,7 @@ Standard laptop touchpads use relative movement with OS pointer acceleration. **
 ### Build with GCC / MinGW
 
 ```bash
-gcc -O3 -o precision-trackpad-mapper.exe finger-draw.c -luser32 -lgdi32
+gcc -O3 -o precision-trackpad-mapper.exe finger-draw.c -luser32 -lgdi32 -lhid
 ```
 
 *(If using a Makefile, update the target binary name to `precision-trackpad-mapper.exe` and run `make`).*
