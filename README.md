@@ -1,4 +1,3 @@
-cat << 'EOF' > README.md
 # Precision Trackpad Mapper (PTM)
 
 Turn your Windows Precision Touchpad into a low-latency, absolute-positioning tablet surface — designed for *osu!* and fast desktop navigation without requiring a physical graphics tablet.
