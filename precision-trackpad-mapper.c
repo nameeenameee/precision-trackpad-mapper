@@ -6,9 +6,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define IN_BUFFER_SIZE     4096
-#define MAX_CACHED_DEVICES 16
-#define TIMER_BLINK_ID     1001
+/* Fix MinGW-w64 missing QWORD in NEXTRAWINPUTBLOCK */
+#ifdef NEXTRAWINPUTBLOCK
+#undef NEXTRAWINPUTBLOCK
+#endif
+#define NEXTRAWINPUTBLOCK(ptr) \
+    ((PRAWINPUT)(((ULONG_PTR)((BYTE*)(ptr) + (ptr)->header.dwSize) + sizeof(ULONG_PTR) - 1) & ~(sizeof(ULONG_PTR) - 1)))
+
+#define IN_BUFFER_SIZE         4096
+#define MAX_CACHED_DEVICES     16
+#define TIMER_BLINK_ID         1001
+#define RAWINPUT_BATCH_COUNT   16
 
 enum {
     FN_MODE_NONE = 0,
@@ -47,7 +55,7 @@ typedef struct {
 
 #define CONFIG_MAGIC 0x434D5450 // 'PTMC'
 
-/* RCU Shared State */
+/* Lock-free Config Snapshot */
 static AppConfig* volatile g_activeCfg = NULL;
 static SRWLOCK g_cfgUpdateLock = SRWLOCK_INIT;
 
@@ -87,7 +95,6 @@ typedef struct {
 
 static CachedDevice g_deviceCache[MAX_CACHED_DEVICES];
 static int g_deviceCacheCount = 0;
-static int g_deviceCacheNextEvict = 0;
 static CachedDevice* g_lastUsedDevice = NULL;
 
 /* Non-blocking boundary blink state */
@@ -101,8 +108,10 @@ static struct {
 void updateScreenMetrics(void) {
     InterlockedExchange(&g_vLeft,   GetSystemMetrics(SM_XVIRTUALSCREEN));
     InterlockedExchange(&g_vTop,    GetSystemMetrics(SM_YVIRTUALSCREEN));
-    InterlockedExchange(&g_vWidth,  GetSystemMetrics(SM_CXVIRTUALSCREEN));
-    InterlockedExchange(&g_vHeight, GetSystemMetrics(SM_CYVIRTUALSCREEN));
+    LONG w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    LONG h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    InterlockedExchange(&g_vWidth,  w > 0 ? w : 1);
+    InterlockedExchange(&g_vHeight, h > 0 ? h : 1);
 }
 
 static inline AppConfig* getActiveConfig(void) {
@@ -176,12 +185,14 @@ static inline PHIDP_PREPARSED_DATA getOrCachePreparsed(HANDLE hDevice) {
         return g_lastUsedDevice->preparsed;
     }
 
-    for (int i = 0; i < g_deviceCacheCount; i++) {
+    for (int i = 0; i < g_deviceCacheCount; ++i) {
         if (g_deviceCache[i].deviceHandle == hDevice) {
             g_lastUsedDevice = &g_deviceCache[i];
             return g_deviceCache[i].preparsed;
         }
     }
+
+    if (g_deviceCacheCount >= MAX_CACHED_DEVICES) return NULL;
 
     UINT size = 0;
     GetRawInputDeviceInfo(hDevice, RIDI_PREPARSEDDATA, NULL, &size);
@@ -195,31 +206,16 @@ static inline PHIDP_PREPARSED_DATA getOrCachePreparsed(HANDLE hDevice) {
         return NULL;
     }
 
-    CachedDevice* target = NULL;
-    if (g_deviceCacheCount < MAX_CACHED_DEVICES) {
-        target = &g_deviceCache[g_deviceCacheCount++];
-    } else {
-        target = &g_deviceCache[g_deviceCacheNextEvict];
-        g_deviceCacheNextEvict = (g_deviceCacheNextEvict + 1) % MAX_CACHED_DEVICES;
-        free(target->preparsed);
-    }
-
+    CachedDevice* target = &g_deviceCache[g_deviceCacheCount++];
     target->deviceHandle = hDevice;
     target->preparsed = preparsed;
     g_lastUsedDevice = target;
     return preparsed;
 }
 
-/* --- Inline Input Dispatch --- */
+/* --- Subpixel Direct Input Dispatch --- */
 
-static inline void sendButtonEventDirect(DWORD dwFlags) {
-    INPUT ip = {0};
-    ip.type = INPUT_MOUSE;
-    ip.mi.dwFlags = dwFlags;
-    SendInput(1, &ip, sizeof(INPUT));
-}
-
-static inline void moveCursorAbsolute(int x, int y) {
+static inline void moveCursorAbsoluteSubpixel(int64_t targetX, int64_t targetY) {
     LONG vL = g_vLeft;
     LONG vT = g_vTop;
     LONG vW = g_vWidth;
@@ -227,8 +223,9 @@ static inline void moveCursorAbsolute(int x, int y) {
 
     if (vW <= 0 || vH <= 0) return;
 
-    DWORD normX = (DWORD)(((int64_t)(x - vL) * 65535) / vW);
-    DWORD normY = (DWORD)(((int64_t)(y - vT) * 65535) / vH);
+    // High precision direct scale to 65535 normalized coordinates
+    DWORD normX = (DWORD)(((targetX - (int64_t)vL) * 65535LL) / (int64_t)vW);
+    DWORD normY = (DWORD)(((targetY - (int64_t)vT) * 65535LL) / (int64_t)vH);
 
     INPUT ip = {0};
     ip.type = INPUT_MOUSE;
@@ -238,12 +235,18 @@ static inline void moveCursorAbsolute(int x, int y) {
     SendInput(1, &ip, sizeof(INPUT));
 }
 
+static inline void sendButtonEventDirect(DWORD dwFlags) {
+    INPUT ip = {0};
+    ip.type = INPUT_MOUSE;
+    ip.mi.dwFlags = dwFlags;
+    SendInput(1, &ip, sizeof(INPUT));
+}
+
 /* --- Hardware Tap/Click Filter Hook Thread --- */
 
 LRESULT CALLBACK HardwareClickFilterProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && g_mode == MODE_ACTIVE) {
         MSLLHOOKSTRUCT* p = (MSLLHOOKSTRUCT*)lParam;
-        /* Drops non-injected hardware clicks and touchpad double-tap gestures */
         if (!(p->flags & LLMHF_INJECTED)) {
             switch (wParam) {
                 case WM_LBUTTONDOWN:
@@ -252,7 +255,7 @@ LRESULT CALLBACK HardwareClickFilterProc(int nCode, WPARAM wParam, LPARAM lParam
                 case WM_RBUTTONUP:
                 case WM_MBUTTONDOWN:
                 case WM_MBUTTONUP:
-                    return 1; // Suppress hardware click
+                    return 1; // Suppress hardware clicks
                 default:
                     break;
             }
@@ -421,21 +424,167 @@ void handleKeyboard(USHORT code, USHORT flags) {
     }
 }
 
-/* --- High-Throughput Window Procedure --- */
+/* --- Optimized HID Packet Parsing & Dispatch --- */
+
+static inline void processRawInputPacket(RAWINPUT* raw) {
+    if (raw->header.dwType == RIM_TYPEKEYBOARD) {
+        handleKeyboard(raw->data.keyboard.MakeCode, raw->data.keyboard.Flags);
+        return;
+    }
+
+    if (raw->header.dwType != RIM_TYPEHID) return;
+
+    PHIDP_PREPARSED_DATA preparsed = getOrCachePreparsed(raw->header.hDevice);
+    if (!preparsed) return;
+
+    ULONG contactId = 0;
+    HidP_GetUsageValue(HidP_Input, 0x0D, 0, 0x51, &contactId, preparsed, raw->data.hid.bRawData, raw->data.hid.dwSizeHid);
+
+    USAGE usages[16];
+    ULONG usageLength = sizeof(usages) / sizeof(USAGE);
+    int tipSwitch = 0;
+    if (HidP_GetUsages(HidP_Input, 0x0D, 0, usages, &usageLength, preparsed, raw->data.hid.bRawData, raw->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) {
+        for (ULONG j = 0; j < usageLength; ++j) {
+            if (usages[j] == 0x42) {
+                tipSwitch = 1;
+                break;
+            }
+        }
+    }
+
+    LONG lockedId = g_activeContactId;
+    if (tipSwitch) {
+        if (lockedId == -1) {
+            InterlockedExchange(&g_activeContactId, contactId);
+            lockedId = (LONG)contactId;
+        }
+    } else {
+        if (lockedId == (LONG)contactId) {
+            InterlockedExchange(&g_activeContactId, -1);
+            lockedId = -1;
+        }
+    }
+
+    if (lockedId != -1 && lockedId != (LONG)contactId) {
+        return;
+    }
+
+    ULONG rawValX = 0, rawValY = 0;
+    if (HidP_GetUsageValue(HidP_Input, 0x01, 0, 0x30, &rawValX, preparsed, raw->data.hid.bRawData, raw->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) {
+        InterlockedExchange(&g_latestRawX, (LONG)rawValX);
+    }
+    if (HidP_GetUsageValue(HidP_Input, 0x01, 0, 0x31, &rawValY, preparsed, raw->data.hid.bRawData, raw->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) {
+        InterlockedExchange(&g_latestRawY, (LONG)rawValY);
+    }
+
+    if (g_mode != MODE_ACTIVE || g_inSettingsMenu) {
+        return;
+    }
+
+    AppConfig* cfg = getActiveConfig();
+    if (!cfg) return;
+
+    LONG rx = g_latestRawX;
+    LONG ry = g_latestRawY;
+
+    // Coalesce inputs into a single SendInput array to save context transitions
+    INPUT inputs[3];
+    int inputCount = 0;
+
+    if (rx != -1 && ry != -1 && tipSwitch) {
+        int64_t tpMinX = cfg->trackpadTopLeftX;
+        int64_t tpMinY = cfg->trackpadTopLeftY;
+        int64_t tpMaxX = cfg->trackpadBottomRightX;
+        int64_t tpMaxY = cfg->trackpadBottomRightY;
+
+        int64_t tpW = tpMaxX - tpMinX;
+        int64_t tpH = tpMaxY - tpMinY;
+        if (tpW <= 0) tpW = 1;
+        if (tpH <= 0) tpH = 1;
+
+        int64_t clX = rx < tpMinX ? tpMinX : (rx > tpMaxX ? tpMaxX : rx);
+        int64_t clY = ry < tpMinY ? tpMinY : (ry > tpMaxY ? tpMaxY : ry);
+
+        int64_t sTopLeftX = cfg->topLeftX;
+        int64_t sTopLeftY = cfg->topLeftY;
+        int64_t sW = (int64_t)cfg->bottomRightX - sTopLeftX;
+        int64_t sH = (int64_t)cfg->bottomRightY - sTopLeftY;
+
+        // Subpixel target coordinate calculation without quantization downsample
+        int64_t targetX = sTopLeftX + ((clX - tpMinX) * sW) / tpW;
+        int64_t targetY = sTopLeftY + ((clY - tpMinY) * sH) / tpH;
+
+        LONG vL = g_vLeft;
+        LONG vT = g_vTop;
+        LONG vW = g_vWidth;
+        LONG vH = g_vHeight;
+
+        DWORD normX = (DWORD)(((targetX - (int64_t)vL) * 65535LL) / (int64_t)vW);
+        DWORD normY = (DWORD)(((targetY - (int64_t)vT) * 65535LL) / (int64_t)vH);
+
+        inputs[inputCount].type = INPUT_MOUSE;
+        inputs[inputCount].mi.dx = normX;
+        inputs[inputCount].mi.dy = normY;
+        inputs[inputCount].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        inputs[inputCount].mi.mouseData = 0;
+        inputs[inputCount].mi.time = 0;
+        inputs[inputCount].mi.dwExtraInfo = 0;
+        inputCount++;
+    }
+
+    int leftDown = 0;
+    LONG dLeft = g_downLeftClick;
+    if (cfg->keyLeftClick != 0) {
+        if (cfg->fnMode == FN_MODE_DOWN)        leftDown = dLeft;
+        else if (cfg->fnMode == FN_MODE_LIFT)   leftDown = tipSwitch && !dLeft;
+        else                                    leftDown = tipSwitch;
+    } else {
+        leftDown = (cfg->fnMode == FN_MODE_NONE) ? tipSwitch : 0;
+    }
+
+    int rightDown = (cfg->keyRightClick != 0) ? (int)g_downRightClick : 0;
+
+    if (leftDown != g_leftTouching) {
+        inputs[inputCount].type = INPUT_MOUSE;
+        inputs[inputCount].mi.dx = 0;
+        inputs[inputCount].mi.dy = 0;
+        inputs[inputCount].mi.dwFlags = leftDown ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+        inputs[inputCount].mi.mouseData = 0;
+        inputs[inputCount].mi.time = 0;
+        inputs[inputCount].mi.dwExtraInfo = 0;
+        inputCount++;
+        InterlockedExchange(&g_leftTouching, leftDown);
+    }
+
+    if (rightDown != g_rightTouching) {
+        inputs[inputCount].type = INPUT_MOUSE;
+        inputs[inputCount].mi.dx = 0;
+        inputs[inputCount].mi.dy = 0;
+        inputs[inputCount].mi.dwFlags = rightDown ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+        inputs[inputCount].mi.mouseData = 0;
+        inputs[inputCount].mi.time = 0;
+        inputs[inputCount].mi.dwExtraInfo = 0;
+        inputCount++;
+        InterlockedExchange(&g_rightTouching, rightDown);
+    }
+
+    if (inputCount > 0) {
+        SendInput(inputCount, inputs, sizeof(INPUT));
+    }
+}
+
+/* --- Optimized Window Procedure with Drained Input Buffer --- */
 
 LRESULT CALLBACK RawInputWndProc(HWND hwnd, unsigned event, WPARAM wparam, LPARAM lparam) {
-    BYTE rawinputBuffer[sizeof(RAWINPUT) + IN_BUFFER_SIZE];
-    USAGE usages[32];
-
     switch (event) {
         case WM_TIMER:
             if (wparam == TIMER_BLINK_ID) {
                 switch (g_blinkState.step++) {
-                    case 0: moveCursorAbsolute(g_blinkState.tlX, g_blinkState.tlY); break;
-                    case 1: moveCursorAbsolute(g_blinkState.brX, g_blinkState.tlY); break;
-                    case 2: moveCursorAbsolute(g_blinkState.brX, g_blinkState.brY); break;
-                    case 3: moveCursorAbsolute(g_blinkState.tlX, g_blinkState.brY); break;
-                    case 4: moveCursorAbsolute(g_blinkState.tlX, g_blinkState.tlY); break;
+                    case 0: moveCursorAbsoluteSubpixel(g_blinkState.tlX, g_blinkState.tlY); break;
+                    case 1: moveCursorAbsoluteSubpixel(g_blinkState.brX, g_blinkState.tlY); break;
+                    case 2: moveCursorAbsoluteSubpixel(g_blinkState.brX, g_blinkState.brY); break;
+                    case 3: moveCursorAbsoluteSubpixel(g_blinkState.tlX, g_blinkState.brY); break;
+                    case 4: moveCursorAbsoluteSubpixel(g_blinkState.tlX, g_blinkState.tlY); break;
                     default:
                         KillTimer(hwnd, TIMER_BLINK_ID);
                         break;
@@ -453,124 +602,33 @@ LRESULT CALLBACK RawInputWndProc(HWND hwnd, unsigned event, WPARAM wparam, LPARA
             return 0;
 
         case WM_INPUT: {
-            UINT size = sizeof(rawinputBuffer);
-            if (GetRawInputData((HRAWINPUT)lparam, RID_INPUT, rawinputBuffer, &size, sizeof(RAWINPUTHEADER)) == (UINT)-1) {
-                return 0;
+            // Stack-allocated batch read buffer to eliminate dynamic allocation
+            alignas(RAWINPUT) BYTE rawBuffer[sizeof(RAWINPUTHEADER) + IN_BUFFER_SIZE];
+            UINT size = sizeof(rawBuffer);
+
+            if (GetRawInputData((HRAWINPUT)lparam, RID_INPUT, rawBuffer, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1) {
+                processRawInputPacket((RAWINPUT*)rawBuffer);
             }
 
-            RAWINPUT* data = (RAWINPUT*)rawinputBuffer;
-            if (data->header.dwType == RIM_TYPEKEYBOARD) {
-                handleKeyboard(data->data.keyboard.MakeCode, data->data.keyboard.Flags);
-                return 0;
-            }
+            // Drain any pending Raw Input packets in queue immediately
+            alignas(RAWINPUT) BYTE batchBuffer[(sizeof(RAWINPUTHEADER) + IN_BUFFER_SIZE) * RAWINPUT_BATCH_COUNT];
+            UINT batchSize = sizeof(batchBuffer);
+            UINT count = GetRawInputBuffer((PRAWINPUT)batchBuffer, &batchSize, sizeof(RAWINPUTHEADER));
 
-            if (data->header.dwType != RIM_TYPEHID) return 0;
-
-            PHIDP_PREPARSED_DATA preparsed = getOrCachePreparsed(data->header.hDevice);
-            if (!preparsed) return 0;
-
-            ULONG contactId = 0;
-            HidP_GetUsageValue(HidP_Input, 0x0D, 0, 0x51, &contactId, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid);
-
-            ULONG usageLength = sizeof(usages) / sizeof(USAGE);
-            int tipSwitch = 0;
-            if (HidP_GetUsages(HidP_Input, 0x0D, 0, usages, &usageLength, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) {
-                for (ULONG j = 0; j < usageLength; j++) {
-                    if (usages[j] == 0x42) {
-                        tipSwitch = 1;
-                        break;
-                    }
+            if (count != (UINT)-1 && count > 0) {
+                PRAWINPUT pCurrent = (PRAWINPUT)batchBuffer;
+                for (UINT i = 0; i < count; ++i) {
+                    processRawInputPacket(pCurrent);
+                    pCurrent = NEXTRAWINPUTBLOCK(pCurrent);
                 }
             }
-
-            LONG lockedId = g_activeContactId;
-            if (tipSwitch) {
-                if (lockedId == -1) {
-                    InterlockedExchange(&g_activeContactId, contactId);
-                    lockedId = (LONG)contactId;
-                }
-            } else {
-                if (lockedId == (LONG)contactId) {
-                    InterlockedExchange(&g_activeContactId, -1);
-                    lockedId = -1;
-                }
-            }
-
-            if (lockedId != -1 && lockedId != (LONG)contactId) {
-                return 0;
-            }
-
-            ULONG rawValX = 0, rawValY = 0;
-            if (HidP_GetUsageValue(HidP_Input, 0x01, 0, 0x30, &rawValX, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) {
-                InterlockedExchange(&g_latestRawX, (LONG)rawValX);
-            }
-            if (HidP_GetUsageValue(HidP_Input, 0x01, 0, 0x31, &rawValY, preparsed, data->data.hid.bRawData, data->data.hid.dwSizeHid) == HIDP_STATUS_SUCCESS) {
-                InterlockedExchange(&g_latestRawY, (LONG)rawValY);
-            }
-
-            if (g_mode != MODE_ACTIVE || g_inSettingsMenu) {
-                return 0;
-            }
-
-            AppConfig* cfg = getActiveConfig();
-            if (!cfg) return 0;
-
-            LONG rx = g_latestRawX;
-            LONG ry = g_latestRawY;
-
-            if (rx != -1 && ry != -1 && tipSwitch) {
-                int64_t tpMinX = cfg->trackpadTopLeftX;
-                int64_t tpMinY = cfg->trackpadTopLeftY;
-                int64_t tpMaxX = cfg->trackpadBottomRightX;
-                int64_t tpMaxY = cfg->trackpadBottomRightY;
-
-                int64_t tpW = tpMaxX - tpMinX;
-                int64_t tpH = tpMaxY - tpMinY;
-                if (tpW <= 0) tpW = 1;
-                if (tpH <= 0) tpH = 1;
-
-                int64_t clX = rx < tpMinX ? tpMinX : (rx > tpMaxX ? tpMaxX : rx);
-                int64_t clY = ry < tpMinY ? tpMinY : (ry > tpMaxY ? tpMaxY : ry);
-
-                int32_t sTopLeftX = cfg->topLeftX;
-                int32_t sTopLeftY = cfg->topLeftY;
-                int64_t sW = (int64_t)cfg->bottomRightX - sTopLeftX;
-                int64_t sH = (int64_t)cfg->bottomRightY - sTopLeftY;
-
-                int pixelX = sTopLeftX + (int)(((clX - tpMinX) * sW) / tpW);
-                int pixelY = sTopLeftY + (int)(((clY - tpMinY) * sH) / tpH);
-
-                moveCursorAbsolute(pixelX, pixelY);
-            }
-
-            int leftDown = 0;
-            LONG dLeft = g_downLeftClick;
-            if (cfg->keyLeftClick != 0) {
-                if (cfg->fnMode == FN_MODE_DOWN)        leftDown = dLeft;
-                else if (cfg->fnMode == FN_MODE_LIFT)   leftDown = tipSwitch && !dLeft;
-                else                                    leftDown = tipSwitch;
-            } else {
-                leftDown = (cfg->fnMode == FN_MODE_NONE) ? tipSwitch : 0;
-            }
-
-            int rightDown = (cfg->keyRightClick != 0) ? (int)g_downRightClick : 0;
-
-            if (leftDown != g_leftTouching) {
-                sendButtonEventDirect(leftDown ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP);
-                InterlockedExchange(&g_leftTouching, leftDown);
-            }
-            if (rightDown != g_rightTouching) {
-                sendButtonEventDirect(rightDown ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP);
-                InterlockedExchange(&g_rightTouching, rightDown);
-            }
-
             return 0;
         }
     }
     return DefWindowProc(hwnd, event, wparam, lparam);
 }
 
-/* --- UI and Configuration Menu --- */
+/* --- Configuration Menu & UI --- */
 
 static void getKeyDisplayString(USHORT code, char* outBuf, size_t outSize) {
     if (code == 0) {
@@ -611,7 +669,7 @@ void printBanner(void) {
     getKeyDisplayString(snap->keySettings, strSet, sizeof(strSet));
 
     puts("===================================================================");
-    puts("              Precision Trackpad Mapper (v2.0.0)                   ");
+    puts("          Precision Trackpad Mapper (v2.0.0)                       ");
     puts("===================================================================");
     puts(" Current Bindings:");
     printKeybind("[Main Modifier]", snap->keyMainMod);
@@ -794,9 +852,10 @@ int main(int argc, char* argv[]) {
     updateConfigRCU(&initCfg);
     loadSettings();
 
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    // High thread & process priority for minimum scheduling latency
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
-    /* Isolated hook thread to suppress physical trackpad button clicks and double taps */
     g_hHookThread = CreateThread(NULL, 0, hookThreadProc, NULL, 0, &g_hookThreadId);
     if (!g_hHookThread) return -1;
     SetThreadPriority(g_hHookThread, THREAD_PRIORITY_HIGHEST);
@@ -828,9 +887,17 @@ int main(int argc, char* argv[]) {
     puts("\n[Engine Running] Listening for inputs. Press Ctrl+C in this window to quit.");
 
     MSG message;
-    while (g_running && GetMessage(&message, NULL, 0, 0)) {
-        TranslateMessage(&message);
-        DispatchMessage(&message);
+    while (g_running) {
+        // Fast message dispatch loop
+        while (PeekMessage(&message, NULL, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) {
+                InterlockedExchange(&g_running, 0);
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessage(&message);
+        }
+        WaitMessage();
     }
 
     InterlockedExchange(&g_running, 0);
