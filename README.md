@@ -34,7 +34,7 @@ Standard laptop trackpads output relative mouse deltas with software acceleratio
 Requires GCC (MinGW-w64) or MSVC on Windows.
 
 ```bash
-gcc -O3 -o precision-trackpad-mapper.exe finger-draw.c -luser32 -lgdi32 -lhid
+gcc -O3 -o precision-trackpad-mapper.exe precision-trackpad-mapper.c -luser32 -lgdi32 -lhid
 ```
 
 ---
